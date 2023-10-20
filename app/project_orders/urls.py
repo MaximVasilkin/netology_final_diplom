@@ -14,16 +14,16 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
-from django.contrib import admin
+from baton.autodiscover import admin
 from django.urls import path, include
-from django_rest_passwordreset.views import reset_password_request_token, reset_password_confirm
 from rest_framework.routers import DefaultRouter
 from users.views import UserViewSet, ConfirmEmailView, PartnerProductView, \
     PartnerStateView, ShopView, CategoryView, ProductView, ContactView, \
-    BasketView, OrderViewSet, BuyerSellerOrderView, PartnerOrderView, AuthenticateView, CustomResetPasswordConfirm
+    BasketView, OrderViewSet, BuyerSellerOrderView, PartnerOrderView, AuthenticateView, CustomResetPasswordConfirm, \
+    CustomResetPasswordRequestToken, ImportView
 
 router = DefaultRouter()
-router.register('partner/products', PartnerProductView, basename='partner')
+router.register('partner/products', PartnerProductView, basename='partner_products')
 router.register('shops', ShopView, basename='shops')
 router.register('categories', CategoryView, basename='categories')
 router.register('products', ProductView, basename='products')
@@ -33,13 +33,15 @@ router.register('order/seller_order', BuyerSellerOrderView, basename='buyer_sell
 router.register('partner/orders', PartnerOrderView, basename='partner_orders')
 
 urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('baton/', include('baton.urls')),
     path('', include('social_django.urls', namespace='social')),
     path('users/', UserViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'post': 'create'}), name='users'),
     path('users/auth/', AuthenticateView.as_view(), name='auth'),
-    path('user/password_reset/', reset_password_request_token, name='password-reset'),
+    path('user/password_reset/', CustomResetPasswordRequestToken.as_view(), name='password-reset'),
     path('user/password_reset/confirm/', CustomResetPasswordConfirm.as_view(), name='password-reset-confirm'),
-    path('admin/', admin.site.urls),
     path('confirm_email/<str:temp_token>', ConfirmEmailView.as_view(), name='confirm_email'),
     path('partner/state/', PartnerStateView.as_view(), name='partner_state'),
     path('basket/', BasketView.as_view(), name='basket'),
+    path('partner/products/import/', ImportView.as_view(), name='partner_import'),
 ] + router.urls

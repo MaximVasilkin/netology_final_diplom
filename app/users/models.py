@@ -1,8 +1,9 @@
 import uuid
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.contrib.auth.models import PermissionsMixin
 from django.contrib.auth.base_user import BaseUserManager, AbstractBaseUser
-from django.db.models import Sum, F, Prefetch
+from django.db.models import Sum, F
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -10,7 +11,7 @@ from project_orders.settings import BASE_DOMAIN
 from .app_choices import UserType, SellerOrderState, BuyerOrderState, UserConfirmation
 from rest_framework.authtoken.models import Token
 from phonenumber_field.modelfields import PhoneNumberField
-from .email_sender import send_confirmation_email
+from .tasks import send_confirmation_email
 
 
 class CustomUserManager(BaseUserManager):
@@ -77,6 +78,11 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     objects = CustomUserManager()
 
+    class Meta:
+        verbose_name = 'Пользователь'
+        verbose_name_plural = 'Пользователи'
+        ordering = ('email',)
+
     def send_email_confirmation(self, request=None):
         token = uuid.uuid4()
         ConfirmRegistrationToken.objects.create(user=self, token=token)
@@ -84,7 +90,7 @@ class User(AbstractBaseUser, PermissionsMixin):
         full_url = request.build_absolute_uri(token_url) if request is not None else BASE_DOMAIN + token_url
         subject = 'Подтверждение регистрации'
         message = f'Для подтверждения регистрации и получения токена перейдите по ссылке: {full_url}'
-        send_confirmation_email(self.email, subject=subject, message=message)
+        send_confirmation_email.delay(self.email, subject=subject, message=message)
         return full_url
 
     def update_auth_token(self):
@@ -106,13 +112,17 @@ class User(AbstractBaseUser, PermissionsMixin):
     def basket_object(self):
         return self.basket_queryset.first()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.password_copy = str(self.password)
+
     def __str__(self):
         return self.email
 
-    class Meta:
-        verbose_name = 'Пользователь'
-        verbose_name_plural = 'Пользователи'
-        ordering = ('email',)
+    def save(self, *args, **kwargs):
+        if self.password_copy and self.password != self.password_copy:
+            self.update_auth_token()
+        return super().save(*args, **kwargs)
 
 
 class ConfirmRegistrationToken(models.Model):
@@ -161,7 +171,7 @@ class Category(models.Model):
 
 
 class ShopCategory(models.Model):
-    external_id = models.PositiveIntegerField()
+    external_id = models.BigIntegerField(validators=[MinValueValidator(1)])
     category = models.ForeignKey(Category,
                                  related_name='shops',
                                  blank=True,
@@ -202,15 +212,15 @@ class Product(models.Model):
 
 
 class ProductInfo(models.Model):
-    external_id = models.PositiveIntegerField()
+    external_id = models.BigIntegerField(validators=[MinValueValidator(1)])
     category = models.ForeignKey(ShopCategory, related_name='product_infos', on_delete=models.CASCADE)
     product = models.ForeignKey(Product, related_name='product_infos', blank=True,
                                 on_delete=models.CASCADE)
     shop = models.ForeignKey(Shop, related_name='product_infos', blank=True,
                              on_delete=models.CASCADE)
     quantity = models.PositiveIntegerField()
-    price = models.PositiveIntegerField()
-    price_rrc = models.PositiveIntegerField()
+    price = models.BigIntegerField(validators=[MinValueValidator(0)])
+    price_rrc = models.BigIntegerField(validators=[MinValueValidator(0)])
 
     class Meta:
         verbose_name = 'Товар магазина'
@@ -381,9 +391,9 @@ class SellerOrderItem(models.Model):
 
     quantity = models.PositiveIntegerField(verbose_name='Количество')
 
-    purchase_price = models.PositiveIntegerField(blank=True, default=None)
+    purchase_price = models.BigIntegerField(validators=[MinValueValidator(0)], blank=True, default=None)
 
-    purchase_price_rrc = models.PositiveIntegerField(blank=True, default=None)
+    purchase_price_rrc = models.BigIntegerField(validators=[MinValueValidator(0)], blank=True, default=None)
 
     class Meta:
         verbose_name = 'Заказанная позиция'

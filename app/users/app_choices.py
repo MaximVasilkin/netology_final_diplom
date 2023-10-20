@@ -7,7 +7,7 @@ class UserType(models.TextChoices):
     seller = 'seller', _('Магазин')
 
 
-class UserConfirmation(models.TextChoices):
+class UserConfirmation(models.IntegerChoices):
     need_user = 2, _('Требуется подтверждение на статус пользователя')
     need_admin = 1, _('Требуется подтверждение на статус админа')
     confirmed = 0, _('Подтверждён')

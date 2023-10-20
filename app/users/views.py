@@ -1,28 +1,52 @@
+import yaml
+from celery.result import AsyncResult
 from django.contrib.auth import authenticate
-from django.db import IntegrityError
 from django.db.models import Prefetch
-from django_rest_passwordreset.views import ResetPasswordConfirm
+from django.urls import reverse
+from django_rest_passwordreset.models import ResetPasswordToken
+from django_rest_passwordreset.serializers import EmailSerializer
+from django_rest_passwordreset.views import ResetPasswordConfirm, ResetPasswordRequestToken
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse, extend_schema_view
 from rest_framework import mixins, status
-from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .filters import ProductFilter, PartnerProductFilter, SellerOrderFilter
-from .permissions import IsPartner, IsShopOwnerOrReadOnly
-from .serializers import UserSerializer, ShopSerializer, ProductInfoSerializer, PartnerProductInfoSerializer, \
-    CategorySerializer, ContactSerializer, OrderItemBuyerSerializer, BuyerOrderSerializer, \
-    PartnerOrderSerializer, PartnerStateSerializer, AuthenticateSerializer, PositiveIntegers, \
-    CustomPasswordTokenSerializer, SellerOrderForBuyerOrderSerializer
+from project_orders.celery import app
+from project_orders.redis import redis_storage
+from .filters import ProductFilter, PartnerProductFilter, SellerOrderFilter, BuyerOrderFilter
+from .pagination import PartnerPagination
+from .permissions import IsPartner, IsShopOwnerOrReadOnly, NotIsImporting
+from .serializers import UserCreateSerializer, UserUpdateSerializer, ShopSerializer, ProductInfoSerializer, \
+    PartnerProductInfoSerializer, CategorySerializer, ContactSerializer, BuyerOrderSerializer, \
+    PartnerOrderSerializer, PartnerStateSerializer, AuthenticateSerializer, \
+    CustomPasswordTokenSerializer, SellerOrderForBuyerOrderSerializer, OrderItemBaseSerializer, ImportSerializer, \
+    SwaggerStringStatusResponseExampleSerializer, SwaggerTokenResponseExampleSerializer, \
+    PartnerProductInfoUpdateSerializer, BasketSerializer
 from .models import User, ConfirmRegistrationToken, Shop, Category, ProductInfo, \
-    BuyerOrder, SellerOrder, SellerOrderItem
+    BuyerOrder, SellerOrder, SellerOrderItem, Contact
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ReadOnlyModelViewSet
-from .email_sender import send_confirmation_email
-import yaml
+from .tasks import send_confirmation_email
+from .importing_products import import_products
 from .app_choices import SellerOrderState, BuyerOrderState, PartnerState, UserConfirmation
-from .filters import BuyerOrderFilter
 from django.utils import timezone
-from .serializers import BasketSerializer
+
+
+def fix_swagger_queryset_decorator(model):
+    def wrapper(old_func):
+        def new_func(self, *args, **kwargs):
+            if getattr(self, 'swagger_fake_view', False):
+                return model.objects.none()
+            return old_func(self, *args, **kwargs)
+        return new_func
+    return wrapper
+
+
+def api_error(message, status_code=status.HTTP_400_BAD_REQUEST):
+    return Response({'error': message}, status=status_code)
+
+
+def param_value_error(value):
+    return api_error(f'`{value}` is not valid value')
 
 
 class UserFromRequestMixin:
@@ -31,14 +55,30 @@ class UserFromRequestMixin:
         return self.request.auth.user
 
 
-class PartnerPaginationMixin:
-    def get_paginated_response(self, data):
-        response = super().get_paginated_response(data)
-        shop = ShopSerializer(self.request.user.shop).data
-        response.data = {'shop': shop, **response.data}
-        return response
+class ImportProcessMixin(UserFromRequestMixin):
+
+    def get_task_id(self):
+        return redis_storage.get(self.user.id)
+
+    def set_task_id(self, task_id):
+        return redis_storage.set(self.user.id, task_id)
 
 
+class CustomResetPasswordRequestToken(ResetPasswordRequestToken):
+
+    @extend_schema(request=EmailSerializer, responses=SwaggerStringStatusResponseExampleSerializer)
+    def post(self, request, *args, **kwargs):
+        result = super().post(request, *args, **kwargs)
+        user_email = request.data.get('email')
+        token_key = ResetPasswordToken.objects.filter(user__email=user_email).first().key
+        send_confirmation_email.delay(user_email,
+                                      subject='Password Reset Token',
+                                      message=token_key)
+        return result
+
+
+@extend_schema_view(post=extend_schema(request=CustomPasswordTokenSerializer,
+                                       responses=SwaggerStringStatusResponseExampleSerializer))
 class CustomResetPasswordConfirm(ResetPasswordConfirm):
     serializer_class = CustomPasswordTokenSerializer
 
@@ -50,7 +90,12 @@ class UserViewSet(mixins.CreateModelMixin,
                   UserFromRequestMixin):
 
     queryset = User.objects.all()
-    serializer_class = UserSerializer
+    http_method_names = ['get', 'post', 'patch']
+
+    def get_serializer_class(self):
+        if self.request.method.lower() == 'patch':
+            return UserUpdateSerializer
+        return UserCreateSerializer
 
     def get_object(self):
         return self.user
@@ -63,7 +108,7 @@ class UserViewSet(mixins.CreateModelMixin,
 
 
 class AuthenticateView(APIView):
-
+    @extend_schema(responses=SwaggerTokenResponseExampleSerializer, request=AuthenticateSerializer)
     def post(self, request, *args, **kwargs):
 
         credentials = request.data
@@ -74,19 +119,30 @@ class AuthenticateView(APIView):
         user = authenticate(request, username=credentials['email'], password=credentials['password'])
         
         if not user:
-            return Response({'error': 'incorrect credentials'}, status.HTTP_418_IM_A_TEAPOT)
+            return api_error('incorrect credentials', status.HTTP_418_IM_A_TEAPOT)
         elif user.need_confirmation:
-            return Response({'error': 'your email has not been confirmed'}, status.HTTP_400_BAD_REQUEST)
+            return api_error('your email has not been confirmed')
 
-        return Response(user.auth_token.key, status.HTTP_200_OK)
+        return Response({'token_key': user.auth_token.key}, status.HTTP_200_OK)
 
 
 class ConfirmEmailView(APIView):
-
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name='temp_token',
+                location=OpenApiParameter.PATH,
+                description='The email confirmation token',
+                required=True,
+                type=str
+            ),
+        ],
+        responses=SwaggerTokenResponseExampleSerializer
+    )
     def get(self, request, temp_token, *args, **kwargs):
         confirm_token_obj = ConfirmRegistrationToken.objects.filter(token=temp_token).select_related('user').first()
         if not confirm_token_obj:
-            return Response({'error': 'incorrect link'}, status=status.HTTP_400_BAD_REQUEST)
+            return api_error('incorrect link')
         user = confirm_token_obj.user
         token_key = user.create_auth_token()
         if user.need_confirmation == UserConfirmation.need_admin:
@@ -95,7 +151,7 @@ class ConfirmEmailView(APIView):
         user.need_confirmation = UserConfirmation.confirmed
         user.save()
         confirm_token_obj.delete()
-        return Response({'token': token_key}, status=status.HTTP_200_OK)
+        return Response({'token_key': token_key}, status=status.HTTP_200_OK)
 
 
 class ShopView(mixins.CreateModelMixin,
@@ -106,6 +162,7 @@ class ShopView(mixins.CreateModelMixin,
 
     queryset = Shop.objects.all()
     serializer_class = ShopSerializer
+    http_method_names = ['get', 'post', 'patch', 'put']
 
     def get_permissions(self):
         """Получение прав для действий."""
@@ -130,100 +187,68 @@ class ProductView(ReadOnlyModelViewSet):
         return ProductInfo.objects.filter(shop__is_open=True, quantity__gt=0).all()
 
 
-class PartnerProductView(PartnerPaginationMixin, ModelViewSet, UserFromRequestMixin):
+class PartnerProductView(ModelViewSet, UserFromRequestMixin):
 
-    serializer_class = PartnerProductInfoSerializer
     filterset_class = PartnerProductFilter
+    pagination_class = PartnerPagination
+    permission_classes = [IsAuthenticated, IsPartner, NotIsImporting]
+    http_method_names = ['get', 'post', 'patch', 'delete']
 
-    def get_permissions(self):
-        """Получение прав для действий."""
-        permissions = [IsAuthenticated()]
-        if self.action != 'create_catalogue':
-            permissions.append(IsPartner())
-        return permissions
-
-    @action(detail=False, methods=['post'], url_path='upload', url_name='upload')
-    def create_catalogue(self, request, *args, **kwargs):
-        user = self.user
-
-        try:
-            uploaded_file = request.FILES['file']
-            yaml_data = uploaded_file.read().decode('utf-8')
-            json_data = yaml.safe_load(yaml_data)
-            shop_name = json_data['shop']
-            categories_source = json_data['categories']
-            categories = {category['id']: {'name': category['name'], 'external_id': category['id']}
-                          for category in categories_source}
-            products = json_data['goods']
-        except:
-            return Response({'error': 'unable to load data from the file'}, status=status.HTTP_400_BAD_REQUEST)
-
-        shop_email = json_data.get('email', user.email)
-        shop_base_shipping_price = int(json_data.get('shipping_price', 300))
-        try:
-            shop, shop_created = \
-                Shop.objects.get_or_create(owner=user, defaults={'name': shop_name,
-                                                                 'email': shop_email,
-                                                                 'base_shipping_price': shop_base_shipping_price})
-        except IntegrityError:
-            return Response({'error': f'{shop_name}: this shop_name is already occupied'},
-                            status=status.HTTP_403_FORBIDDEN)
-
-        validated_product_infos = []
-
-        for product_source in products:
-            __source_info = {'categories': categories_source, 'product': product_source}
-
-            try:
-                category_external_id = product_source['category']
-                category = categories[category_external_id]
-            except KeyError as error:
-                return Response({'category_error': 'parse or matching error', 'key': str(error)} | __source_info,
-                                status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                product_parameters = [dict(zip(('parameter', 'value'), i))
-                                      for i in product_source['parameters'].items()]
-
-                product_data = {'external_id': product_source['id'],
-                                'category': category,
-                                'product': {'name': product_source['name']},
-                                'product_parameters': product_parameters,
-                                'price': product_source['price'],
-                                'price_rrc': product_source['price_rrc'],
-                                'quantity': product_source['quantity']}
-
-            except KeyError as error:
-                return Response({'product_error': 'parse', 'invalid_field': str(error)} | __source_info,
-                                status=status.HTTP_400_BAD_REQUEST)
-
-            product_info_serializer = self.get_serializer(data=product_data)
-
-            try:
-                product_info_serializer.is_valid(raise_exception=True)
-            except ValidationError as error:
-                return Response({'product': product_source} | error.detail, status=status.HTTP_400_BAD_REQUEST)
-
-            validated_product_infos.append(product_info_serializer.validated_data)
-
-        if shop_created or not shop.product_infos.exists():
-            for product_info in validated_product_infos:
-                self.get_serializer().create(product_info)
-        else:
-            shop.product_infos.exclude(external_id__in={product_info['external_id']
-                                                        for product_info in validated_product_infos}).update(quantity=0)
-
-            for product_info in validated_product_infos:
-                self.get_serializer().update_or_create(product_info)
-
-        return Response({'status': 'ok'}, status=status.HTTP_201_CREATED)
+    def get_serializer_class(self):
+        if self.request.method.lower() == 'patch':
+            return PartnerProductInfoUpdateSerializer
+        return PartnerProductInfoSerializer
 
     def perform_destroy(self, instance):
         instance.quantity = 0
         instance.save()
 
+    @fix_swagger_queryset_decorator(ProductInfo)
     def get_queryset(self, *args, **kwargs):
         return self.user.shop.product_infos.all()
+
+
+class ImportView(APIView, ImportProcessMixin):
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.request.method.lower() == 'post':
+            permissions.append(NotIsImporting())
+        return permissions
+
+    @extend_schema(responses=ImportSerializer)
+    def get(self, request, *args, **kwargs):
+        task_id = self.get_task_id()
+
+        if not task_id:
+            return Response({'status': 'no processing'}, status=status.HTTP_200_OK)
+
+        task = AsyncResult(task_id.decode(), app=app)
+
+        message = {'status': task.status,
+                   'result': task.result}
+        return Response(message, status=status.HTTP_200_OK)
+
+    @extend_schema(responses=ImportSerializer,
+                   request={'multipart/form-data': ImportSerializer})
+    def post(self, request, *args, **kwargs):
+        data = request.data
+        ImportSerializer(data=data).is_valid(raise_exception=True)
+
+        try:
+            uploaded_file = data['file']
+            yaml_data = uploaded_file.read().decode('utf-8')
+            json_data = yaml.safe_load(yaml_data)
+        except:
+            return api_error('unable to load data from the file', status.HTTP_406_NOT_ACCEPTABLE)
+
+        task = import_products.delay(self.user.id, self.user.email, json_data)
+
+        self.set_task_id(task.id)
+
+        return Response({'status': 'processing',
+                         'result':  {'url': request.build_absolute_uri(reverse('partner_import'))}},
+                        status=status.HTTP_201_CREATED)
 
 
 class PartnerStateView(APIView, UserFromRequestMixin):
@@ -234,9 +259,11 @@ class PartnerStateView(APIView, UserFromRequestMixin):
     def users_shop(self):
         return self.user.shop
 
+    @extend_schema(responses=PartnerStateSerializer)
     def get(self, request):
-        return Response({'Your shop is open': self.users_shop.is_open}, status=status.HTTP_200_OK)
+        return Response({'shop_is_open': self.users_shop.is_open}, status=status.HTTP_200_OK)
 
+    @extend_schema(responses=PartnerStateSerializer, request=PartnerStateSerializer)
     def post(self, request):
         states = {PartnerState.open: True, PartnerState.closed: False}
 
@@ -248,7 +275,7 @@ class PartnerStateView(APIView, UserFromRequestMixin):
 
         self.users_shop.is_open = new_state
         self.users_shop.save()
-        return Response({'Your shop is open': new_state}, status=status.HTTP_201_CREATED)
+        return Response({'shop_is_open': new_state}, status=status.HTTP_201_CREATED)
 
 
 class ContactView(ModelViewSet, UserFromRequestMixin):
@@ -256,6 +283,7 @@ class ContactView(ModelViewSet, UserFromRequestMixin):
     serializer_class = ContactSerializer
     permission_classes = [IsAuthenticated]
 
+    @fix_swagger_queryset_decorator(Contact)
     def get_queryset(self, *args, **kwargs):
         return self.user.contacts.filter(is_deleted=False).all()
 
@@ -264,19 +292,26 @@ class ContactView(ModelViewSet, UserFromRequestMixin):
         instance.save()
 
 
+BASKET_DEL_PARAM_NAME = 'product_info'
+BASKET_DEL_PARAM_DELIMITER = ','
+
+
 class BasketView(APIView, UserFromRequestMixin):
+
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(responses=BasketSerializer)
     def get(self, request, *args, **kwargs):
-        basket = []
-        if _basket_object := self.user.basket_object: basket.append(_basket_object)
-        return Response(BasketSerializer(basket, many=True).data, status=status.HTTP_200_OK)
+        _basket_object = self.user.basket_object
+        return Response(BasketSerializer(_basket_object).data if _basket_object else {},
+                        status=status.HTTP_200_OK)
 
+    @extend_schema(responses=BasketSerializer, request=OrderItemBaseSerializer(many=True))
     def post(self, request, *args, **kwargs):
         basket = self.user.basket_object or BuyerOrder.objects.create(user=self.request.auth.user,
                                                                       state=BuyerOrderState.basket)
 
-        ordered_items_serializer = OrderItemBuyerSerializer(data=request.data, many=True)
+        ordered_items_serializer = OrderItemBaseSerializer(data=request.data, many=True)
         ordered_items_serializer.is_valid(raise_exception=True)
 
         validated_ordered_items = {ordered_item_dict['product_info'].id: ordered_item_dict['quantity']
@@ -301,21 +336,55 @@ class BasketView(APIView, UserFromRequestMixin):
                                                                    'purchase_price': product_info.price,
                                                                    'purchase_price_rrc': product_info.price_rrc})
 
-        return Response(BasketSerializer(basket).data, status=status.HTTP_201_CREATED)
+        return Response(BasketSerializer(self.user.basket_object).data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(
+        responses={
+            200: OpenApiResponse(response=BasketSerializer,
+                                 description='Deleted.'),
+        },
+        parameters=[
+            OpenApiParameter(
+                name=BASKET_DEL_PARAM_NAME,
+                location=OpenApiParameter.QUERY,
+                description=f'IDs of product info you want to remove from the basket. '
+                            f'Example: {BASKET_DEL_PARAM_NAME}={BASKET_DEL_PARAM_DELIMITER.join(["1", "20", "5"])}',
+                required=True,
+                type=str
+            ),
+        ]
+    )
     def delete(self, request, *args, **kwargs):
-        ids_to_del = request.data
 
-        PositiveIntegers(data=ids_to_del).is_valid(raise_exception=True)
+        ids_to_del_value: str = request.GET.get(BASKET_DEL_PARAM_NAME, None)
+
+        if ids_to_del_value is None:
+            return api_error(f'`{BASKET_DEL_PARAM_NAME}` - this URL`s parameter is required')
+
+        ids_to_del_value = ids_to_del_value.strip(BASKET_DEL_PARAM_DELIMITER)
+
+        if ids_to_del_value == '':
+            return param_value_error(BASKET_DEL_PARAM_DELIMITER)
+
+        ids_to_del = set()
+
+        for item in ids_to_del_value.split(BASKET_DEL_PARAM_DELIMITER):
+
+            if item == '':
+                continue
+
+            if item.isdigit() and (id_to_del := int(item)) > 0:
+                ids_to_del.add(id_to_del)
+            else:
+                return param_value_error(item)
 
         basket = self.user.basket_queryset.prefetch_related('seller_orders__shop',
                                                             'seller_orders__ordered_items',
                                                             'seller_orders__ordered_items__product_info').first()
 
         if not basket:
-            return Response({'error': f'Your basket does not exists'}, status=status.HTTP_400_BAD_REQUEST)
+            return api_error('Your basket does not exists')
 
-        ids_to_del = set(ids_to_del)
         seller_orders_baskets = basket.seller_orders.all()
 
         all_ordered_ids = {ordered_item.product_info.id for seller_order in seller_orders_baskets
@@ -324,11 +393,11 @@ class BasketView(APIView, UserFromRequestMixin):
 
         if unknown_ids:
             unknown_ids = ', '.join(map(str, unknown_ids))
-            return Response({'error': f'Unknown ids {unknown_ids}'}, status=status.HTTP_400_BAD_REQUEST)
+            return api_error(f'Unknown ids: {unknown_ids}')
 
         if basket.state == BuyerOrderState.basket and ids_to_del == all_ordered_ids:
             basket.delete()
-            return Response([], status=status.HTTP_204_NO_CONTENT)
+            return Response({}, status=status.HTTP_200_OK)
 
         seller_orders_to_del = {}
         ordered_items_to_del = set()
@@ -363,7 +432,7 @@ class BasketView(APIView, UserFromRequestMixin):
         if ordered_items_to_del:
             SellerOrderItem.objects.filter(id__in=ordered_items_to_del).delete()
 
-        return Response(BasketSerializer(basket).data, status=status.HTTP_204_NO_CONTENT)
+        return Response(BasketSerializer(basket).data, status=status.HTTP_200_OK)
 
 
 class OrderViewSet(mixins.CreateModelMixin,
@@ -375,7 +444,9 @@ class OrderViewSet(mixins.CreateModelMixin,
     permission_classes = [IsAuthenticated]
     serializer_class = BuyerOrderSerializer
     filterset_class = BuyerOrderFilter
+    http_method_names = ['get', 'post']
 
+    @fix_swagger_queryset_decorator(BuyerOrder)
     def get_queryset(self, *args, **kwargs):
         return self.user.orders.exclude(state=BuyerOrderState.basket).all()
 
@@ -387,17 +458,12 @@ class OrderViewSet(mixins.CreateModelMixin,
                                                       'seller_orders__ordered_items__product_info',
                                                       'seller_orders__ordered_items__product_info__product').first()
         if not order:
-            return Response({'error': 'no order to confirm'}, status=status.HTTP_204_NO_CONTENT)
+            return api_error('no order to confirm', status.HTTP_200_OK)
 
-        contact_id = request.data.get('contact')
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        if not isinstance(contact_id, int) or contact_id <= 0:
-            return Response({'error': 'bad contact'}, status=status.HTTP_400_BAD_REQUEST)
-
-        users_contact = user.contacts.filter(id=contact_id).first()
-
-        if not users_contact:
-            return Response({'error': 'contact not found'}, status=status.HTTP_400_BAD_REQUEST)
+        users_contact = serializer.validated_data['contact']
 
         all_orders = order.seller_orders.all()
 
@@ -449,7 +515,7 @@ class OrderViewSet(mixins.CreateModelMixin,
                           f'Доставить по адресу:\n{str(users_contact)}\n' \
                           f'Итог: {seller_order.summary}'
 
-                send_confirmation_email(seller_order.shop.email, subject=subject, message=message)
+                send_confirmation_email.delay(seller_order.shop.email, subject=subject, message=message)
 
             order.state = BuyerOrderState.accepted
             order.created_at = current_date
@@ -477,7 +543,7 @@ class OrderViewSet(mixins.CreateModelMixin,
                       f'Суммарная цена доставки: {summary_shipping_price}\n' \
                       f'Итог: {order.total_sum}'
 
-            send_confirmation_email(user.email, subject=subject, message=message)
+            send_confirmation_email.delay(user.email, subject=subject, message=message)
 
         return Response(self.get_serializer(order).data,
                         status=status.HTTP_201_CREATED if acceptable_order else status.HTTP_206_PARTIAL_CONTENT)
@@ -489,7 +555,9 @@ class BuyerSellerOrderView(mixins.DestroyModelMixin,
 
     permission_classes = [IsAuthenticated]
     serializer_class = SellerOrderForBuyerOrderSerializer
+    http_method_names = ['delete']
 
+    @fix_swagger_queryset_decorator(SellerOrder)
     def get_queryset(self):
         return SellerOrder.objects.filter(buyer_order__user_id=self.user.id,
                                           state__in=SellerOrderState.get_cancelable_by_user_states()
@@ -514,11 +582,10 @@ class BuyerSellerOrderView(mixins.DestroyModelMixin,
             seller_email = seller_order_instance.shop.email
             subject = f'Заказ {seller_order_instance.id} отменён'
             message = f'{subject} пользователем. Товары возвращены на склад.'
-            send_confirmation_email(seller_email, subject=subject, message=message)
+            send_confirmation_email.delay(seller_email, subject=subject, message=message)
 
 
-class PartnerOrderView(PartnerPaginationMixin,
-                       mixins.RetrieveModelMixin,
+class PartnerOrderView(mixins.RetrieveModelMixin,
                        # продавец может менять только state и shipping_price
                        mixins.UpdateModelMixin,
                        mixins.ListModelMixin,
@@ -527,8 +594,11 @@ class PartnerOrderView(PartnerPaginationMixin,
 
     permission_classes = [IsAuthenticated, IsPartner]
     serializer_class = PartnerOrderSerializer
+    pagination_class = PartnerPagination
     filterset_class = SellerOrderFilter
+    http_method_names = ['get', 'patch']
 
+    @fix_swagger_queryset_decorator(SellerOrder)
     def get_queryset(self):
         return self.user.shop.orders.exclude(state=SellerOrderState.basket).all()
 

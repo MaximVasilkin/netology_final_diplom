@@ -1,10 +1,11 @@
 from django.contrib.auth.hashers import make_password, check_password
+from django.core.validators import FileExtensionValidator
 from django.db import IntegrityError
 from django_rest_passwordreset.serializers import PasswordTokenSerializer
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework.validators import UniqueTogetherValidator
-from .email_sender import send_confirmation_email
+from .tasks import send_confirmation_email
 from .models import User, Shop, Category, Product, Contact, \
     ProductParameter, ProductInfo, SellerOrderItem, SellerOrder, Parameter, ShopCategory, BuyerOrder, ValueOfParameter
 from .app_choices import SellerOrderState, PartnerState
@@ -12,15 +13,12 @@ from django.contrib.auth.password_validation import validate_password
 
 
 class ContactSerializer(serializers.ModelSerializer):
-    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+    user = serializers.HiddenField(default=serializers.CurrentUserDefault(), write_only=True)
 
     class Meta:
         model = Contact
         fields = ('id', 'city', 'street', 'house', 'structure', 'building', 'apartment', 'user', 'phone')
         read_only_fields = ('id',)
-        extra_kwargs = {
-            'user': {'write_only': True}
-        }
 
         validators = [
             UniqueTogetherValidator(
@@ -44,23 +42,6 @@ class ContactSerializer(serializers.ModelSerializer):
 
 
 class PasswordMatchValidateMixin:
-    def validate(self, attrs):
-        password = attrs.get('password')
-        confirmed_password = attrs.pop('password2')
-        if password != confirmed_password:
-            raise serializers.ValidationError({'password': 'Password mismatch'})
-        return attrs
-
-
-class UserSerializer(serializers.ModelSerializer, PasswordMatchValidateMixin):
-    current_password = serializers.CharField(required=False, write_only=True)
-    password2 = serializers.CharField(write_only=True)
-
-    class Meta:
-        model = User
-        fields = ('id', 'username', 'current_password', 'password', 'password2', 'email', 'first_name', 'last_name')
-        extra_kwargs = {'password': {'write_only': True}}
-        read_only_fields = ('id', )
 
     def validate_password(self, value):
         validate_password(value)
@@ -68,8 +49,28 @@ class UserSerializer(serializers.ModelSerializer, PasswordMatchValidateMixin):
 
     def validate(self, attrs):
         if 'password' in attrs or 'password2' in attrs:
-            return PasswordMatchValidateMixin.validate(self, attrs)
+            password = attrs.get('password')
+            confirmed_password = attrs.pop('password2', '')
+            if password != confirmed_password:
+                raise serializers.ValidationError({'password': 'Password mismatch'})
         return attrs
+
+
+class UserBaseSerializer(PasswordMatchValidateMixin, serializers.ModelSerializer):
+    password2 = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = User
+        fields = ('id', )
+        read_only_fields = ('id',)
+
+
+class UserCreateSerializer(UserBaseSerializer):
+
+    class Meta(UserBaseSerializer.Meta):
+        fields = UserBaseSerializer.Meta.fields + \
+                 ('username', 'email', 'first_name', 'last_name', 'password', 'password2',)
+        extra_kwargs = {'password': {'write_only': True}}
 
     def create(self, validated_data):
         validated_data['password'] = make_password(validated_data['password'])
@@ -77,18 +78,26 @@ class UserSerializer(serializers.ModelSerializer, PasswordMatchValidateMixin):
         user.send_email_confirmation(self.context['request'])
         return user
 
-    def update(self, instance, validated_data):
-        if 'email' in validated_data:
-            del validated_data['email']
 
-        if 'password' in validated_data:
-            current_password = validated_data.pop('current_password')
+class UserUpdateSerializer(UserBaseSerializer):
+    current_password = serializers.CharField(required=False, write_only=True)
+
+    class Meta(UserBaseSerializer.Meta):
+        fields = UserBaseSerializer.Meta.fields + \
+                 ('username', 'email', 'first_name', 'last_name', 'current_password', 'password', 'password2',)
+        extra_kwargs = {'password': {'write_only': True},
+                        'email': {'read_only': True}}
+
+    def update(self, instance, validated_data):
+        #  валидация при смене пароля
+        if {'current_password', 'password', 'password2'} & validated_data.keys():
+            current_password = validated_data.pop('current_password', '')
             if current_password == validated_data.get('password'):
-                raise serializers.ValidationError('Current password and new password can not be same')
+                raise serializers.ValidationError({'password': 'Current password and new password can not be same'})
             if not check_password(current_password, instance.password):
-                raise serializers.ValidationError('Incorrect current password')
+                raise serializers.ValidationError({'current_password': 'Incorrect current password'})
             validated_data['password'] = make_password(validated_data['password'])
-            instance.update_auth_token()
+
         return super().update(instance, validated_data)
 
 
@@ -106,7 +115,7 @@ class ShopSerializer(serializers.ModelSerializer):
     def validate(self, data):
         request = self.context['request']
         user = request.auth.user
-        if request.method == 'POST' and Shop.objects.filter(owner=user).first():
+        if request.method.lower() == 'post' and Shop.objects.filter(owner=user).first():
             raise ValidationError({'error': 'you already have a shop'})
         return data
 
@@ -189,61 +198,27 @@ class PartnerProductInfoBriefSerializer(ProductInfoBaseSerializer):
         fields = ('product_parameters', 'quantity', 'price', 'price_rrc',)
 
 
-class PartnerProductInfoSerializer(ProductInfoBaseSerializer):
-    product = ProductSerializer()
+class PartnerProductInfoUpdateSerializer(ProductInfoBaseSerializer):
+    product = ProductSerializer(read_only=True)
     product_parameters = ProductParameterSerializer(many=True)
-    category = PartnerCategorySerializer()
+    category = PartnerCategorySerializer(read_only=True)
 
     class Meta(ProductInfoBaseSerializer.Meta):
         fields = ('id', 'external_id', 'category', 'product', 'product_parameters', 'quantity', 'price', 'price_rrc',)
+        read_only_fields = ('id', 'external_id')
 
-    @property
-    def is_http_method_update(self):
-        return self.context['request'].method in {'PATCH', 'PUT'}
+    def add_parameters(self, product_info: ProductInfo, product_parameters: list | tuple, replace_old: bool = False):
+        if replace_old: product_info.product_parameters.all().delete()
 
-    def validate_external_id(self, value):
-        if self.is_http_method_update:
-            raise ValidationError(f'changing of external_id not allowed')
-        elif self.context['view'].action != 'create_catalogue' \
-                and self.shop.product_infos.filter(external_id=value).exists():
-
-            raise ValidationError(f'product with external_id {value} is already exists in your shop')
-        return value
-
-    def validate(self, attrs):
-        unupdatable_fields = {'product', 'category'}
-        if self.is_http_method_update and unupdatable_fields & attrs.keys():
-            raise ValidationError({'error': f'changing of fields {", ".join(unupdatable_fields)} not allowed'})
-        return attrs
-
-    def create(self, validated_data):
-        product_data = validated_data.pop('product')
-        category_data = validated_data.pop('category')
-        category_external_id = category_data['external_id']
-        category_name = category_data['name']
-
-        category_object, category_created = Category.objects.get_or_create(name=category_name)
-
-        try:
-            shop_category, shop_category_created = \
-                self.shop.categories.get_or_create(category=category_object,
-                                                   defaults={'external_id': category_external_id})
-
-        except IntegrityError:
-            raise ValidationError({'category_external_id': f'category with external_id '
-                                                           f'{category_external_id} already exists'})
-
-        product_object, product_created = Product.objects.get_or_create(name=product_data['name'])
-
-        product_parameters = validated_data.pop('product_parameters')
-
-        product_info = ProductInfo.objects.create(product=product_object,
-                                                  shop=self.shop,
-                                                  category=shop_category,
-                                                  **validated_data)
-
-        self._add_parameters(product_info, product_parameters)
-        return product_info
+        for parameter_dict in product_parameters:
+            try:
+                parameter, created = Parameter.objects.get_or_create(name=parameter_dict['parameter'])
+                value, created = ValueOfParameter.objects.get_or_create(value=parameter_dict['value'])
+                ProductParameter.objects.create(product_info=product_info,
+                                                parameter=parameter,
+                                                value=value)
+            except:
+                raise ValidationError({'product_parameters': 'bad fields'})
 
     def update(self, instance, validated_data):
 
@@ -256,12 +231,66 @@ class PartnerProductInfoSerializer(ProductInfoBaseSerializer):
         product_parameters = validated_data.pop('product_parameters', None)
 
         if product_parameters is not None:
-            self._add_parameters(instance, product_parameters, replace_old=True)
+            self.add_parameters(instance, product_parameters, replace_old=True)
 
         return super().update(instance, validated_data)
 
-    def update_or_create(self, validated_data: dict):
-        instance = self.shop.product_infos.filter(external_id=validated_data['external_id'])\
+
+class PartnerProductInfoSerializer(PartnerProductInfoUpdateSerializer):
+    product = ProductSerializer()
+    category = PartnerCategorySerializer()
+
+    #  метаданные от самого базового сериализатора
+    class Meta(ProductInfoBaseSerializer.Meta):
+        fields = ('id', 'external_id', 'category', 'product', 'product_parameters', 'quantity', 'price', 'price_rrc',)
+
+    @property
+    def shop(self):
+        return self.context['request'].auth.user.shop
+
+    @property
+    def is_importing(self):
+        return not {'request', 'view'} & self.context.keys()
+
+    def validate_external_id(self, value):
+        if not self.is_importing and self.shop.product_infos.filter(external_id=value).exists():
+            raise ValidationError(f'product with external_id {value} is already exists in your shop')
+        return value
+
+    def create(self, validated_data, shop=None):
+        shop = shop or self.shop
+        product_data = validated_data.pop('product')
+        category_data = validated_data.pop('category')
+        category_external_id = category_data['external_id']
+        category_name = category_data['name']
+
+        category_object, category_created = Category.objects.get_or_create(name=category_name)
+
+        try:
+            shop_category, shop_category_created = \
+                shop.categories.get_or_create(category=category_object,
+                                              defaults={'external_id': category_external_id})
+
+        except IntegrityError:
+            raise ValidationError({'category_external_id': f'category with external_id '
+                                                           f'{category_external_id} already exists'})
+
+        product_object, product_created = Product.objects.get_or_create(name=product_data['name'])
+
+        product_parameters = validated_data.pop('product_parameters')
+
+        product_info = ProductInfo.objects.create(product=product_object,
+                                                  shop=shop,
+                                                  category=shop_category,
+                                                  **validated_data)
+
+        self.add_parameters(product_info, product_parameters)
+        return product_info
+
+    def update_or_create(self, validated_data: dict, shop: Shop = None):
+        shop = shop or self.shop
+
+        instance = shop.product_infos.filter(external_id=validated_data['external_id'])\
             .prefetch_related('product_parameters',
                               'product_parameters__parameter',
                               'product_parameters__value').first()
@@ -277,39 +306,23 @@ class PartnerProductInfoSerializer(ProductInfoBaseSerializer):
                 fields_to_update['product_parameters'] = product_parameters_new
             return self.update(instance, fields_to_update) if fields_to_update else instance
         else:
-            return self.create(validated_data)
-
-    def _add_parameters(self, product_info: ProductInfo, product_parameters: list | tuple, replace_old: bool = False):
-        if replace_old: product_info.product_parameters.all().delete()
-
-        for parameter_dict in product_parameters:
-            try:
-                parameter, created = Parameter.objects.get_or_create(name=parameter_dict['parameter'])
-                value, created = ValueOfParameter.objects.get_or_create(value=parameter_dict['value'])
-                ProductParameter.objects.create(product_info=product_info,
-                                                parameter=parameter,
-                                                value=value)
-            except:
-                raise ValidationError({'error': 'bad parameters fields'})
-
-    @property
-    def shop(self):
-        return self.context['request'].auth.user.shop
+            return self.create(validated_data, shop)
 
 
 class OrderItemBaseSerializer(serializers.ModelSerializer):
-
-    status = serializers.CharField(read_only=True, required=False)
+    quantity = serializers.IntegerField(min_value=1)
 
     class Meta:
         model = SellerOrderItem
-        fields = ('id', 'product_info', 'quantity', 'order', 'status')
+        fields = ('product_info', 'quantity')
 
 
 class OrderItemBuyerSerializer(OrderItemBaseSerializer):
 
+    status = serializers.CharField(read_only=True, required=False)
+
     class Meta(OrderItemBaseSerializer.Meta):
-        fields = ('product_info', 'quantity', 'order', 'status',)
+        fields = ('id', 'product_info', 'quantity', 'order', 'status',)
         extra_kwargs = {
             'order': {'write_only': True},
 
@@ -357,20 +370,30 @@ class SellerOrderForBuyerOrderSerializer(SellerOrderForBasketSerializer):
 
 class BasketSerializer(serializers.ModelSerializer):
     seller_orders = SellerOrderForBasketSerializer(read_only=True, many=True)
-    total_sum = serializers.IntegerField()
+    total_sum = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = BuyerOrder
         fields = ('id', 'seller_orders', 'total_sum', )
-        read_only_fields = fields
+        read_only_fields = ('id', )
 
 
 class BuyerOrderSerializer(BasketSerializer):
     seller_orders = SellerOrderForBuyerOrderSerializer(read_only=True, many=True)
     contact = ContactSerializer(read_only=True)
+    contact_id = serializers.PrimaryKeyRelatedField(queryset=Contact.objects.all(),
+                                                    source='contact',
+                                                    write_only=True)
 
     class Meta(BasketSerializer.Meta):
-        fields = ('id', 'seller_orders', 'contact', 'total_sum', 'state', 'created_at', )
+        fields = ('id', 'seller_orders', 'contact', 'contact_id', 'total_sum', 'state', 'created_at', )
+        read_only_fields = BasketSerializer.Meta.read_only_fields + ('state', 'created_at', )
+
+    def validate_contact_id(self, value):
+        request = self.context['request']
+        if not request.auth.user.contacts.filter(id=request.data.get('contact_id'), is_deleted=False).first():
+            raise serializers.ValidationError('invalid contact')
+        return value
 
 
 class ProductInfoForSellerOrderSerializer(ProductInfoBaseSerializer):
@@ -388,15 +411,15 @@ class PartnerOrderSerializer(serializers.ModelSerializer):
     ordered_items = PartnerOrderProductsSerializer(read_only=True, many=True)
     state = serializers.ChoiceField(choices=SellerOrderState.choices[1:])  # убираем статус корзины
 
-    summary = serializers.IntegerField()
-    contact = ContactSerializer()
-    created_at = serializers.DateTimeField()
+    summary = serializers.IntegerField(read_only=True)
+    contact = ContactSerializer(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = SellerOrder
 
         fields = ('id', 'ordered_items', 'contact', 'created_at', 'updated_at', 'state', 'shipping_price', 'summary')
-        read_only_fields = ('id', 'ordered_items', 'summary', 'contact', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'updated_at')
 
     def validate_state(self, value):
         if self.instance.state in {SellerOrderState.canceled, SellerOrderState.delivered}:
@@ -422,13 +445,14 @@ class PartnerOrderSerializer(serializers.ModelSerializer):
                       f'\nСтатус вложенного заказа {seller_order_id} ' \
                       f'от магазина {instance.shop.name} изменён на: {new_state}\n\n'
 
-            send_confirmation_email(buyer_email, subject=subject, message=message)
+            send_confirmation_email.delay(buyer_email, subject=subject, message=message)
 
         return super().update(instance, validated_data)
 
 
 class PartnerStateSerializer(serializers.Serializer):
-    state = serializers.ChoiceField(choices=PartnerState.choices)
+    state = serializers.ChoiceField(choices=PartnerState.choices, write_only=True)
+    shop_is_open = serializers.BooleanField(read_only=True)
 
 
 class PositiveIntegers(serializers.ListSerializer):
@@ -438,5 +462,21 @@ class PositiveIntegers(serializers.ListSerializer):
 class CustomPasswordTokenSerializer(PasswordTokenSerializer, PasswordMatchValidateMixin):
     password2 = serializers.CharField()
 
-    validate = PasswordMatchValidateMixin.validate
+    def validate(self, data):
+        PasswordTokenSerializer.validate(self, data)
+        PasswordMatchValidateMixin.validate(self, data)
+        return data
 
+
+class ImportSerializer(serializers.Serializer):
+    status = serializers.CharField(read_only=True)
+    result = serializers.JSONField(allow_null=True, read_only=True)
+    file = serializers.FileField(validators=[FileExtensionValidator(['yml', 'yaml'])], write_only=True)
+
+
+class SwaggerStringStatusResponseExampleSerializer(serializers.Serializer):
+    status = serializers.CharField(read_only=True)
+
+
+class SwaggerTokenResponseExampleSerializer(serializers.Serializer):
+    token_key = serializers.CharField(read_only=True)
