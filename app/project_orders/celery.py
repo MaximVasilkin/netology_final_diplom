@@ -11,4 +11,11 @@ app = Celery('django_celery',
              backend=CELERY_RESULT_BACKEND,
              broker=CELERY_BROKER_URL)
 
+
+# пикл нужен для django-imagekit cache backend, Celery
+app.conf.event_serializer = 'pickle'
+app.conf.task_serializer = 'pickle'
+app.conf.result_serializer = 'pickle'
+app.conf.accept_content = ['application/json', 'application/x-python-serialize']
+
 app.autodiscover_tasks()

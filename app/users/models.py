@@ -7,11 +7,14 @@ from django.db.models import Sum, F
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from project_orders.settings import BASE_DOMAIN
+from project_orders.settings import BASE_DOMAIN, AVATAR_DEFAULT, get_avatar_path, \
+    PRODUCT_PICTURE_DEFAULT, get_product_picture_path
 from .app_choices import UserType, SellerOrderState, BuyerOrderState, UserConfirmation
 from rest_framework.authtoken.models import Token
 from phonenumber_field.modelfields import PhoneNumberField
 from .tasks import send_confirmation_email
+from imagekit.models import ImageSpecField
+from imagekit.processors import ResizeToFit
 
 
 class CustomUserManager(BaseUserManager):
@@ -60,18 +63,28 @@ class CustomUserManager(BaseUserManager):
 
 
 class User(AbstractBaseUser, PermissionsMixin):
+
+    picture = models.ImageField(upload_to=get_avatar_path,
+                                default=AVATAR_DEFAULT,
+                                blank=False,
+                                null=False)
+
+    picture_thumbnail = ImageSpecField(source='picture',
+                                       processors=[ResizeToFit(100, 100)],
+                                       format='JPEG',
+                                       options={'quality': 60})
+
     password = models.CharField(_('password'), max_length=128, null=False)
     first_name = models.CharField(max_length=30, null=False)
     last_name = models.CharField(max_length=30, null=False)
-    username = models.CharField(max_length=30, null=True)
+    username = models.CharField(max_length=30, blank=True)
     email = models.EmailField(_('email address'), unique=True, null=False)
     is_staff = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     date_joined = models.DateTimeField(default=timezone.now)
 
     type = models.CharField(choices=UserType.choices, max_length=20, default=UserType.buyer)
-    need_confirmation = models.IntegerField(choices=UserConfirmation.choices,
-                                            default=UserConfirmation.need_user)
+    need_confirmation = models.IntegerField(choices=UserConfirmation.choices, default=UserConfirmation.need_user)
 
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = []
@@ -212,12 +225,21 @@ class Product(models.Model):
 
 
 class ProductInfo(models.Model):
+
+    picture = models.ImageField(upload_to=get_product_picture_path,
+                                default=PRODUCT_PICTURE_DEFAULT,
+                                blank=False,
+                                null=False)
+
+    picture_thumbnail = ImageSpecField(source='picture',
+                                       processors=[ResizeToFit(100, 100)],
+                                       format='JPEG',
+                                       options={'quality': 60})
+
     external_id = models.BigIntegerField(validators=[MinValueValidator(1)])
     category = models.ForeignKey(ShopCategory, related_name='product_infos', on_delete=models.CASCADE)
-    product = models.ForeignKey(Product, related_name='product_infos', blank=True,
-                                on_delete=models.CASCADE)
-    shop = models.ForeignKey(Shop, related_name='product_infos', blank=True,
-                             on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, related_name='product_infos', blank=True, on_delete=models.CASCADE)
+    shop = models.ForeignKey(Shop, related_name='product_infos', blank=True, on_delete=models.CASCADE)
     quantity = models.PositiveIntegerField()
     price = models.BigIntegerField(validators=[MinValueValidator(0)])
     price_rrc = models.BigIntegerField(validators=[MinValueValidator(0)])
@@ -281,8 +303,10 @@ class ProductParameter(models.Model):
 
 
 class Contact(models.Model):
-    user = models.ForeignKey(User, verbose_name='Пользователь',
-                             related_name='contacts', blank=True,
+    user = models.ForeignKey(User,
+                             verbose_name='Пользователь',
+                             related_name='contacts',
+                             blank=True,
                              on_delete=models.CASCADE)
 
     city = models.CharField(max_length=50, verbose_name='Город')
@@ -307,8 +331,10 @@ class Contact(models.Model):
 
 
 class BuyerOrder(models.Model):
-    user = models.ForeignKey(User, verbose_name='Пользователь',
-                             related_name='orders', null=True,
+    user = models.ForeignKey(User,
+                             verbose_name='Пользователь',
+                             related_name='orders',
+                             null=True,
                              on_delete=models.CASCADE)
 
     created_at = models.DateTimeField(null=True)
@@ -334,11 +360,16 @@ class BuyerOrder(models.Model):
 
 
 class SellerOrder(models.Model):
-    buyer_order = models.ForeignKey(BuyerOrder, verbose_name='Заказ покупателя',
-                                    related_name='seller_orders', null=True,
+    buyer_order = models.ForeignKey(BuyerOrder,
+                                    verbose_name='Заказ покупателя',
+                                    related_name='seller_orders',
+                                    null=True,
                                     on_delete=models.CASCADE)
-    shop = models.ForeignKey(Shop, verbose_name='Заказы продавца',
-                             related_name='orders', null=True,
+
+    shop = models.ForeignKey(Shop,
+                             verbose_name='Заказы продавца',
+                             related_name='orders',
+                             null=True,
                              on_delete=models.CASCADE)
 
     updated_at = models.DateTimeField(auto_now=True)
@@ -347,9 +378,11 @@ class SellerOrder(models.Model):
 
     state = models.CharField(verbose_name='Статус', choices=SellerOrderState.choices, max_length=15)
 
-    contact = models.ForeignKey(Contact, verbose_name='Контакт',
+    contact = models.ForeignKey(Contact,
+                                verbose_name='Контакт',
                                 related_name='seller_orders',
-                                blank=True, null=True,
+                                blank=True,
+                                null=True,
                                 on_delete=models.CASCADE)
 
     shipping_price = models.PositiveIntegerField()
@@ -382,10 +415,16 @@ class SellerOrder(models.Model):
 
 
 class SellerOrderItem(models.Model):
-    order = models.ForeignKey(SellerOrder, verbose_name='Заказ', related_name='ordered_items', blank=True, null=True,
+    order = models.ForeignKey(SellerOrder,
+                              verbose_name='Заказ',
+                              related_name='ordered_items',
+                              blank=True,
+                              null=True,
                               on_delete=models.CASCADE)
 
-    product_info = models.ForeignKey(ProductInfo, verbose_name='Информация о продукте', related_name='ordered_items',
+    product_info = models.ForeignKey(ProductInfo,
+                                     verbose_name='Информация о продукте',
+                                     related_name='ordered_items',
                                      blank=True,
                                      on_delete=models.CASCADE)
 

@@ -9,7 +9,7 @@ https://docs.djangoproject.com/en/4.2/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
-
+import uuid
 from pathlib import Path
 from os import getenv, path
 
@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     'social_django',
 
     'phonenumber_field',
+    'imagekit',
 
     'corsheaders',
     'users.apps.UsersConfig',
@@ -65,6 +66,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
 
+    'social_django.middleware.SocialAuthExceptionMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
 
@@ -100,7 +102,7 @@ TEMPLATES = [
                 'django.contrib.messages.context_processors.messages',
 
                 'social_django.context_processors.backends',
-                'social_django.context_processors.login_redirect',
+                #'social_django.context_processors.login_redirect',
 
             ],
         },
@@ -158,6 +160,44 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = path.join(BASE_DIR, 'static')
 
+# Media files
+MEDIA_URL = '/media/'
+MEDIA_ROOT = path.join(BASE_DIR, 'media')
+
+
+DEFAULT_PICTURE_NAME = 'default.jpg'
+
+
+def _get_file_path(picture_folder, filename):
+
+    ext = filename.split('.')[-1]
+    filename = f'{uuid.uuid4()}.{ext}'
+    return path.join(picture_folder, filename)
+
+
+#  USER AVATARS
+AVATARS_UPLOAD_TO = 'user_avatars'
+
+AVATAR_DEFAULT = path.join(AVATARS_UPLOAD_TO, DEFAULT_PICTURE_NAME)
+
+
+def get_avatar_path(instance, filename):
+
+    return _get_file_path(AVATARS_UPLOAD_TO, filename)
+
+
+#  PRODUCT PICTURE
+
+PRODUCT_PICTURE_UPLOAD_TO = 'product_pictures'
+
+PRODUCT_PICTURE_DEFAULT = path.join(PRODUCT_PICTURE_UPLOAD_TO, DEFAULT_PICTURE_NAME)
+
+
+def get_product_picture_path(instance, filename):
+
+    return _get_file_path(PRODUCT_PICTURE_UPLOAD_TO, filename)
+
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
@@ -169,7 +209,7 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
-        'social_core.backends.vk.VKOAuth2'
+        #'social_core.backends.vk.VKOAuth2'
     ],
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.UserRateThrottle',
@@ -188,6 +228,9 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
+IMAGEKIT_DEFAULT_CACHEFILE_BACKEND = 'imagekit.cachefiles.backends.Celery'  # async thumbnails processing
+IMAGEKIT_DEFAULT_CACHEFILE_STRATEGY = 'imagekit.cachefiles.strategies.Optimistic'
+
 SPECTACULAR_SETTINGS = {
     'SWAGGER_UI_DIST': 'SIDECAR',  # shorthand to use the sidecar instead
     'SWAGGER_UI_FAVICON_HREF': 'SIDECAR',
@@ -205,15 +248,20 @@ SPECTACULAR_SETTINGS = {
     'COMPONENT_SPLIT_REQUEST': True
 }
 
-SOCIAL_AUTH_JSONFIELD_ENABLED = True
-SOCIAL_AUTH_VK_OAUTH2_SCOPE = ['email']
-SOCIAL_AUTH_VK_APP_USER_MODE = 1
+# SOCIAL_AUTH_AUTHENTICATION_BACKENDS = ('social_core.backends.vk.VKOAuth2',)
+# LOGIN_ERROR_URL = '/error/'
+# SOCIAL_AUTH_VK_OAUTH2_API_VERSION = '5.81'
+# SOCIAL_AUTH_LOGIN_REDIRECT_URL = '/'
+# SOCIAL_AUTH_URL_NAMESPACE = 'social'
+# SOCIAL_AUTH_USER_MODEL = 'users.User'
 
-SOCIAL_AUTH_VK_OAUTH2_KEY = getenv('SOCIAL_AUTH_VK_OAUTH2_KEY')
+SOCIAL_AUTH_JSONFIELD_ENABLED = True
+
+SOCIAL_AUTH_VK_OAUTH2_SCOPE = ['email']
+
+SOCIAL_AUTH_VK_OAUTH2_KEY = int(getenv('SOCIAL_AUTH_VK_OAUTH2_KEY'))
 SOCIAL_AUTH_VK_OAUTH2_SECRET = getenv('SOCIAL_AUTH_VK_OAUTH2_SECRET')
 
-LOGIN_REDIRECT_URL = '/'
-SOCIAL_AUTH_URL_NAMESPACE = 'social'
 SOCIAL_AUTH_ADMIN_USER_SEARCH_FIELDS = ['first_name', 'email']
 
 SOCIAL_AUTH_USER_FIELDS = ['username', 'email', 'password', 'need_confirmation']

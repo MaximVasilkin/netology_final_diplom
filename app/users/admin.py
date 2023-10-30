@@ -1,5 +1,6 @@
 from django.contrib.admin import register as admin_register, ModelAdmin, TabularInline
 from django.contrib.auth.admin import UserAdmin
+from imagekit.admin import AdminThumbnail
 from .models import User, ConfirmRegistrationToken, Shop, Category, Product, Contact, \
     ProductParameter, ProductInfo, SellerOrderItem, SellerOrder, \
     Parameter, ShopCategory, BuyerOrder, ValueOfParameter, Token
@@ -56,19 +57,29 @@ class CustomUserAdmin(UserAdmin):
     """
     model = User
 
+    list_display = ('id',
+                    'email',
+                    'first_name',
+                    'last_name',
+                    'is_staff',
+                    'need_confirmation',
+                    '__str__',
+                    'admin_thumbnail')
+
+    admin_thumbnail = AdminThumbnail(image_field='picture_thumbnail')
+
     add_fieldsets = UserAdmin.add_fieldsets + (
-        (None, {'fields': ('email', 'first_name', 'last_name')}),
+        (None, {'fields': ('picture', 'email', 'first_name', 'last_name')}),
     )
 
     fieldsets = (
-        (None, {'fields': ('email', 'password', 'type')}),
+        (None, {'fields': ('picture', 'email', 'password', 'type')}),
         ('Personal info', {'fields': ('first_name', 'last_name', 'username')}),
         ('Permissions', {
             'fields': ('is_active', 'is_staff', 'need_confirmation', 'is_superuser', 'groups', 'user_permissions'),
         }),
         ('Important dates', {'fields': ('last_login', 'date_joined')}),
     )
-    list_display = ('email', 'first_name', 'last_name', 'is_staff', 'need_confirmation')
 
     list_filter = UserAdmin.list_filter + ('need_confirmation', )
 
@@ -114,7 +125,19 @@ class ProductAdmin(ModelAdmin):
 
 @admin_register(ProductInfo)
 class ProductInfoAdmin(ModelAdmin):
-    list_display = ('id', 'external_id', 'category', 'product', 'shop', 'quantity', 'price', 'price_rrc')
+    list_display = ('id',
+                    'external_id',
+                    'category',
+                    'product',
+                    'shop',
+                    'quantity',
+                    'price',
+                    'price_rrc',
+                    '__str__',
+                    'admin_thumbnail')
+
+    admin_thumbnail = AdminThumbnail(image_field='picture_thumbnail')
+
     search_fields = ('external_id', 'product__name')
     list_filter = ('shop__name', 'category__category__name')
     inlines = (ProductParameterInline, )

@@ -56,7 +56,13 @@ class PasswordMatchValidateMixin:
         return attrs
 
 
-class UserBaseSerializer(PasswordMatchValidateMixin, serializers.ModelSerializer):
+class PictureSerializerMixin(serializers.ModelSerializer):
+    picture = serializers.ImageField(max_length=None, use_url=True, read_only=True)
+    picture_thumbnail = serializers.ImageField(max_length=None, use_url=True, read_only=True)
+
+
+class UserBaseSerializer(PasswordMatchValidateMixin, PictureSerializerMixin):
+
     password2 = serializers.CharField(write_only=True)
 
     class Meta:
@@ -69,7 +75,14 @@ class UserCreateSerializer(UserBaseSerializer):
 
     class Meta(UserBaseSerializer.Meta):
         fields = UserBaseSerializer.Meta.fields + \
-                 ('username', 'email', 'first_name', 'last_name', 'password', 'password2',)
+                 ('username',
+                  'email',
+                  'first_name',
+                  'last_name',
+                  'password',
+                  'password2',
+                  'picture',
+                  'picture_thumbnail', )
         extra_kwargs = {'password': {'write_only': True}}
 
     def create(self, validated_data):
@@ -80,11 +93,20 @@ class UserCreateSerializer(UserBaseSerializer):
 
 
 class UserUpdateSerializer(UserBaseSerializer):
+
     current_password = serializers.CharField(required=False, write_only=True)
 
     class Meta(UserBaseSerializer.Meta):
         fields = UserBaseSerializer.Meta.fields + \
-                 ('username', 'email', 'first_name', 'last_name', 'current_password', 'password', 'password2',)
+                 ('username',
+                  'email',
+                  'first_name',
+                  'last_name',
+                  'current_password',
+                  'password',
+                  'password2',
+                  'picture',
+                  'picture_thumbnail', )
         extra_kwargs = {'password': {'write_only': True},
                         'email': {'read_only': True}}
 
@@ -99,6 +121,22 @@ class UserUpdateSerializer(UserBaseSerializer):
             validated_data['password'] = make_password(validated_data['password'])
 
         return super().update(instance, validated_data)
+
+
+class UserPictureUpdateSerializer(PictureSerializerMixin):
+    picture = serializers.ImageField(max_length=None, use_url=True)
+
+    class Meta:
+        model = User
+        fields = ('id',
+                  'username',
+                  'email',
+                  'first_name',
+                  'last_name',
+                  'picture',
+                  'picture_thumbnail', )
+
+        read_only_fields = fields[:-2] + (fields[-1], )
 
 
 class AuthenticateSerializer(serializers.Serializer):
@@ -171,7 +209,7 @@ class ProductParameterSerializer(serializers.ModelSerializer):
         fields = ('parameter', 'value',)
 
 
-class ProductInfoBaseSerializer(serializers.ModelSerializer):
+class ProductInfoBaseSerializer(PictureSerializerMixin):
     product = ProductSerializer(read_only=True)
     product_parameters = ProductParameterSerializer(read_only=True, many=True)
 
@@ -184,17 +222,36 @@ class ProductInfoSerializer(ProductInfoBaseSerializer):
     shop = ShopSerializer(read_only=True)
 
     class Meta(ProductInfoBaseSerializer.Meta):
-        fields = ('id', 'category', 'product', 'product_parameters', 'shop', 'quantity', 'price', 'price_rrc',)
+        fields = ('id',
+                  'category',
+                  'product',
+                  'product_parameters',
+                  'shop',
+                  'quantity',
+                  'price',
+                  'price_rrc',
+                  'picture',
+                  'picture_thumbnail', )
         read_only_fields = ('id',)
 
 
 class ProductInfoForOrderSerializer(ProductInfoSerializer):
     class Meta(ProductInfoBaseSerializer.Meta):
-        fields = ('id', 'category', 'product', 'product_parameters', 'price', 'price_rrc',)
+        fields = ('id',
+                  'category',
+                  'product',
+                  'product_parameters',
+                  'price',
+                  'price_rrc',
+                  'picture',
+                  'picture_thumbnail', )
 
 
-class PartnerProductInfoBriefSerializer(ProductInfoBaseSerializer):
-    class Meta(ProductInfoBaseSerializer.Meta):
+class PartnerProductInfoBriefSerializer(serializers.ModelSerializer):
+    product_parameters = ProductParameterSerializer(read_only=True, many=True)
+
+    class Meta:
+        model = ProductInfo
         fields = ('product_parameters', 'quantity', 'price', 'price_rrc',)
 
 
@@ -204,7 +261,17 @@ class PartnerProductInfoUpdateSerializer(ProductInfoBaseSerializer):
     category = PartnerCategorySerializer(read_only=True)
 
     class Meta(ProductInfoBaseSerializer.Meta):
-        fields = ('id', 'external_id', 'category', 'product', 'product_parameters', 'quantity', 'price', 'price_rrc',)
+        fields = ('id',
+                  'external_id',
+                  'category',
+                  'product',
+                  'product_parameters',
+                  'quantity',
+                  'price',
+                  'price_rrc',
+                  'picture',
+                  'picture_thumbnail',
+                  )
         read_only_fields = ('id', 'external_id')
 
     def add_parameters(self, product_info: ProductInfo, product_parameters: list | tuple, replace_old: bool = False):
@@ -236,13 +303,33 @@ class PartnerProductInfoUpdateSerializer(ProductInfoBaseSerializer):
         return super().update(instance, validated_data)
 
 
+class PartnerProductInfoPictureUpdateSerializer(PartnerProductInfoUpdateSerializer):
+    picture = serializers.ImageField(max_length=None, use_url=True)
+    product_parameters = ProductParameterSerializer(many=True, read_only=True)
+
+    class Meta(PartnerProductInfoUpdateSerializer.Meta):
+
+        read_only_fields = PartnerProductInfoUpdateSerializer.Meta.fields[:-2] + \
+                           (PartnerProductInfoUpdateSerializer.Meta.fields[-1], )
+
+
 class PartnerProductInfoSerializer(PartnerProductInfoUpdateSerializer):
     product = ProductSerializer()
     category = PartnerCategorySerializer()
 
     #  метаданные от самого базового сериализатора
     class Meta(ProductInfoBaseSerializer.Meta):
-        fields = ('id', 'external_id', 'category', 'product', 'product_parameters', 'quantity', 'price', 'price_rrc',)
+        fields = ('id',
+                  'external_id',
+                  'category',
+                  'product',
+                  'product_parameters',
+                  'quantity',
+                  'price',
+                  'price_rrc',
+                  'picture',
+                  'picture_thumbnail',
+                  )
 
     @property
     def shop(self):
@@ -400,7 +487,16 @@ class ProductInfoForSellerOrderSerializer(ProductInfoBaseSerializer):
     category = PartnerCategorySerializer()
 
     class Meta(ProductInfoBaseSerializer.Meta):
-        fields = ('id', 'external_id', 'category', 'product', 'product_parameters', 'price', 'price_rrc',)
+        fields = ('id',
+                  'external_id',
+                  'category',
+                  'product',
+                  'product_parameters',
+                  'price',
+                  'price_rrc',
+                  'picture',
+                  'picture_thumbnail',
+                  )
 
 
 class PartnerOrderProductsSerializer(OrderItemBuyerSerializer):

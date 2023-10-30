@@ -16,12 +16,13 @@ from project_orders.redis import redis_storage
 from .filters import ProductFilter, PartnerProductFilter, SellerOrderFilter, BuyerOrderFilter
 from .pagination import PartnerPagination
 from .permissions import IsPartner, IsShopOwnerOrReadOnly, NotIsImporting
-from .serializers import UserCreateSerializer, UserUpdateSerializer, ShopSerializer, ProductInfoSerializer, \
-    PartnerProductInfoSerializer, CategorySerializer, ContactSerializer, BuyerOrderSerializer, \
+from .serializers import UserCreateSerializer, UserUpdateSerializer, UserPictureUpdateSerializer, \
+    ShopSerializer, ProductInfoSerializer, PartnerProductInfoSerializer, \
+    CategorySerializer, ContactSerializer, BuyerOrderSerializer, \
     PartnerOrderSerializer, PartnerStateSerializer, AuthenticateSerializer, \
     CustomPasswordTokenSerializer, SellerOrderForBuyerOrderSerializer, OrderItemBaseSerializer, ImportSerializer, \
     SwaggerStringStatusResponseExampleSerializer, SwaggerTokenResponseExampleSerializer, \
-    PartnerProductInfoUpdateSerializer, BasketSerializer
+    PartnerProductInfoUpdateSerializer, PartnerProductInfoPictureUpdateSerializer, BasketSerializer
 from .models import User, ConfirmRegistrationToken, Shop, Category, ProductInfo, \
     BuyerOrder, SellerOrder, SellerOrderItem, Contact
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ReadOnlyModelViewSet
@@ -83,6 +84,25 @@ class CustomResetPasswordConfirm(ResetPasswordConfirm):
     serializer_class = CustomPasswordTokenSerializer
 
 
+def _get_dynamic_serializer_class(request, create_serializer, update_serializer, picture_update_serializer):
+    if request.method.lower() == 'patch':
+        if 'multipart/form-data' in request.content_type.lower():
+            return picture_update_serializer
+        return update_serializer
+    return create_serializer
+
+
+@extend_schema_view(create=extend_schema(responses=UserCreateSerializer,
+                                         request={'application/json': UserCreateSerializer}),
+
+                    update=extend_schema(responses=UserUpdateSerializer,
+                                         request={'application/json': UserUpdateSerializer,
+                                                  'multipart/form-data': UserPictureUpdateSerializer}),
+
+                    partial_update=extend_schema(responses=UserUpdateSerializer,
+                                                 request={'application/json': UserUpdateSerializer,
+                                                          'multipart/form-data': UserPictureUpdateSerializer})
+                    )
 class UserViewSet(mixins.CreateModelMixin,
                   mixins.RetrieveModelMixin,
                   mixins.UpdateModelMixin,
@@ -93,9 +113,10 @@ class UserViewSet(mixins.CreateModelMixin,
     http_method_names = ['get', 'post', 'patch']
 
     def get_serializer_class(self):
-        if self.request.method.lower() == 'patch':
-            return UserUpdateSerializer
-        return UserCreateSerializer
+        return _get_dynamic_serializer_class(self.request,
+                                             UserCreateSerializer,
+                                             UserUpdateSerializer,
+                                             UserPictureUpdateSerializer)
 
     def get_object(self):
         return self.user
@@ -187,6 +208,17 @@ class ProductView(ReadOnlyModelViewSet):
         return ProductInfo.objects.filter(shop__is_open=True, quantity__gt=0).all()
 
 
+@extend_schema_view(create=extend_schema(responses=PartnerProductInfoSerializer,
+                                         request={'application/json': PartnerProductInfoSerializer}),
+
+                    update=extend_schema(responses=PartnerProductInfoUpdateSerializer,
+                                         request={'application/json': PartnerProductInfoUpdateSerializer,
+                                                  'multipart/form-data': PartnerProductInfoPictureUpdateSerializer}),
+
+                    partial_update=extend_schema(responses=PartnerProductInfoUpdateSerializer,
+                                                 request={'application/json': PartnerProductInfoUpdateSerializer,
+                                                          'multipart/form-data': PartnerProductInfoPictureUpdateSerializer})
+                    )
 class PartnerProductView(ModelViewSet, UserFromRequestMixin):
 
     filterset_class = PartnerProductFilter
@@ -195,9 +227,10 @@ class PartnerProductView(ModelViewSet, UserFromRequestMixin):
     http_method_names = ['get', 'post', 'patch', 'delete']
 
     def get_serializer_class(self):
-        if self.request.method.lower() == 'patch':
-            return PartnerProductInfoUpdateSerializer
-        return PartnerProductInfoSerializer
+        return _get_dynamic_serializer_class(self.request,
+                                             PartnerProductInfoSerializer,
+                                             PartnerProductInfoUpdateSerializer,
+                                             PartnerProductInfoPictureUpdateSerializer)
 
     def perform_destroy(self, instance):
         instance.quantity = 0
